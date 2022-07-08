@@ -1,10 +1,10 @@
 import atexit
-import os
-import re
-import uuid
-from typing import Union
-
-import pydantic
+import psycopg2
+from task import match_email_app
+from celery import Celery
+from celery.result import AsyncResult
+from decouple import config
+from flask_mail import Mail, Message
 from flask import Flask, jsonify, request
 from flask.views import MethodView
 from flask_bcrypt import Bcrypt
@@ -17,19 +17,49 @@ from sqlalchemy import (
     create_engine,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.exc import IntegrityError
+
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 
-app = Flask("server")
+
+
+app_name='server'
+app = Flask(app_name)
+app.config['UPLOAD_FOLDER'] = 'files'
+celery=Celery(
+    app_name,
+    broker='redis://localhost:6379/1',
+    backend='redis://localhost:6379/2',
+)
+celery.conf.update(app.config)
+
+class ContextTask(celery.Task):
+    def __call__(self, *args, **kwargs):
+        with app.app_context():
+            return self.run(*args, **kwargs)
+
+celery.Task = ContextTask
+
+
 bcrypt = Bcrypt(app)
-engine = create_engine('postgresql://app:1234@127.0.0.1:5432/netology')
+engine = create_engine(config('ENGINE_CREATE'))
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
 
 
 atexit.register(lambda: engine.dispose())
+
+
+app.config['SECRET_KEY'] = config('SECRET_KEY')
+app.config['SQLALCHEMY_DATABASE_URI'] = config('SQLALCHEMY_DATABASE_URI')
+app.config['MAIL_SERVER'] = config('MAIL_SERVER')
+app.config['MAIL_PORT'] = config('MAIL_PORT', cast=int)
+app.config['MAIL_USE_TLS'] = config('MAIL_USE_TLS', cast=bool)
+app.config['MAIL_USE_SSL'] = config('MAIL_USE_SSL', cast=bool)
+app.config['MAIL_USERNAME'] = config('MAIL_USERNAME')  # введите свой адрес электронной почты здесь
+app.config['MAIL_PASSWORD'] = config('MAIL_PASSWORD')  # введите пароль
+
+mail=Mail(app)
 
 
 
@@ -88,6 +118,35 @@ class ADSViews(MethodView):
             session.commit()
 
 
+
+
+
+@celery.task()
+def post_mail():
+    result = match_email_app(app, mail)
+    return result
+
+class MailSend(MethodView):
+
+    def post(self):
+        task = post_mail().delay(15)
+        print(task)
+        return jsonify({
+            "task_id": task.id
+        })
+
+
+    def get(self, task_id):
+        task = AsyncResult(task_id, app=celery)
+        return jsonify({'status': task.status,
+                        'result': task.result})
+
+
+
+
+
+
+
 app.add_url_rule('/ads/', view_func=ADSViews.as_view('create_ads'), methods=['POST'])
 app.add_url_rule(
     "/ads/<int:id>/", view_func=ADSViews.as_view("get_ads"), methods=["GET"]
@@ -98,9 +157,10 @@ app.add_url_rule(
 app.add_url_rule(
     "/ads/<int:id>/", view_func=ADSViews.as_view("delete_ads"), methods=["DELETE"]
 )
+app.add_url_rule('/letter/', view_func=MailSend.as_view('Mail_send'), methods=['POST'])
 
-
-app.run(
-    host='0.0.0.0',
-    port=5000
-)
+if __name__ == '__main__':
+    app.run(
+        host='0.0.0.0',
+        port=5000
+    )
